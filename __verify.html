@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Artist Reference · 数据与渲染自检</title>
+<style>body{font:13px/1.6 monospace;padding:16px;white-space:pre-wrap;}</style>
+</head>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+const lines = []
+const pass = []
+const fail = []
+function check(name, ok, extra = '') {
+  lines.push((ok ? '✔ ' : '✘ ') + name + (extra ? '  → ' + extra : ''))
+  ;(ok ? pass : fail).push(name)
+}
+function done() {
+  lines.push('')
+  lines.push(`共 ${pass.length + fail.length} 项，失败 ${fail.length} 项`)
+  lines.push(fail.length === 0 ? 'RESULT: ALL PASS' : 'RESULT: FAIL -> ' + fail.join(' / '))
+  document.getElementById('out').textContent = lines.join('\n')
+}
+
+// 造一张真实 PNG 的字节（浏览器内生成）
+async function makePngBytes(w, h, bg, label) {
+  const c = document.createElement('canvas')
+  c.width = w; c.height = h
+  const g = c.getContext('2d')
+  g.fillStyle = bg; g.fillRect(0, 0, w, h)
+  g.fillStyle = '#fff'; g.font = 'bold 30px sans-serif'; g.fillText(label, 18, 62)
+  const blob = await new Promise(r => c.toBlob(r, 'image/png'))
+  return new Uint8Array(await blob.arrayBuffer())
+}
+
+// 走真实渲染路径：字节 -> Blob -> objectURL -> <img> 解码
+async function canDecode(blob) {
+  if (!blob) return { ok: false, why: '没有数据' }
+  const url = URL.createObjectURL(blob)
+  const img = new Image()
+  img.src = url
+  try {
+    await img.decode()
+    return { ok: img.naturalWidth > 0, why: `${img.naturalWidth}x${img.naturalHeight}` }
+  } catch (e) {
+    return { ok: false, why: 'decode 失败: ' + e.message }
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+
+function openRaw(name, version, onUpgrade) {
+  return new Promise((resolve, reject) => {
+    const r = indexedDB.open(name, version)
+    r.onupgradeneeded = e => onUpgrade(e.target.result, e.oldVersion)
+    r.onsuccess = () => resolve(r.result)
+    r.onerror = () => reject(r.error)
+  })
+}
+
+try {
+  const bytesA = await makePngBytes(320, 240, '#c0392b', 'OLD 1')
+  const bytesB = await makePngBytes(320, 240, '#2471a3', 'OLD 2')
+  const bytesAv = await makePngBytes(140, 140, '#7d3c98', 'A')
+
+  // ---------- 1) 造一个 v1 老库（图片/头像都存 Blob，分类还是字符串） ----------
+  await new Promise((res) => {
+    const r = indexedDB.deleteDatabase('artist-reference')
+    r.onsuccess = res; r.onerror = res; r.onblocked = res
+  })
+
+  const v1 = await openRaw('artist-reference', 1, (db) => {
+    const ch = db.createObjectStore('characters', { keyPath: 'id' })
+    ch.createIndex('by_name', 'name'); ch.createIndex('by_updatedAt', 'updatedAt')
+    const im = db.createObjectStore('images', { keyPath: 'id' })
+    im.createIndex('by_characterId', 'characterId')
+  })
+
+  await new Promise((res, rej) => {
+    const tx = v1.transaction(['characters', 'images'], 'readwrite')
+    const t = Date.now()
+    tx.objectStore('characters').add({
+      id: 'char-old', name: '旧版角色', workName: '迁移测试', intro: '',
+      avatarBlob: new Blob([bytesAv], { type: 'image/png' }), createdAt: t, updatedAt: t
+    })
+    const im = tx.objectStore('images')
+    im.add({ id: 'img-old-1', characterId: 'char-old', fileName: '旧数据-1.png',
+      blob: new Blob([bytesA], { type: 'image/png' }), category: 'expression', note: '',
+      tags: [], positionX: 0, positionY: 0, scale: 1, rotation: 0, createdAt: t, updatedAt: t })
+    im.add({ id: 'img-old-2', characterId: 'char-old', fileName: '旧数据-2.png',
+      blob: new Blob([bytesB], { type: 'image/png' }), category: 'outfit', note: '',
+      tags: [], positionX: 0, positionY: 0, scale: 1, rotation: 0, createdAt: t + 1, updatedAt: t + 1 })
+    tx.oncomplete = res
+    tx.onerror = () => rej(tx.error)
+  })
+  v1.close()
+  check('前置：真实浏览器里造好 v1 老数据', true)
+
+  // ---------- 2) 用应用自己的数据层打开（触发 v1→v2→v3 迁移） ----------
+  const m = await import('/src/db.js')
+  const db = await m.openDB()
+  check('openDB 打开到版本 ' + db.version, db.version === 3)
+
+  const imgs = await m.getImagesByCharacter('char-old')
+  check('迁移后仍是 2 张图片', imgs.length === 2, `实际 ${imgs.length}`)
+  check('记录已换成字节（data）且不再有 blob 字段',
+    imgs.every(x => x.data && !x.blob), imgs.map(x => `data=${x.data ? x.data.byteLength : 'null'}`).join(', '))
+  check('字节内容与原始图片一致',
+    imgs[0].data.byteLength === bytesA.byteLength &&
+    new Uint8Array(imgs[0].data).every((v, i) => v === bytesA[i]))
+
+  const cats = await m.getCategoriesByCharacter('char-old')
+  check('补出了 6 个默认分类', cats.length === 6, `实际 ${cats.length}`)
+  const expr = cats.find(c => c.name === '表情')
+  check('旧分类字符串 expression 正确映射到「表情」',
+    !!expr && imgs[0].categoryId === expr.id)
+
+  const ch = await m.getCharacter('char-old')
+  check('头像迁移成 avatarData', !!ch.avatarData && !ch.avatarBlob)
+
+  // ---------- 3) 真实渲染：字节 -> Blob -> <img> 能否解码 ----------
+  const dec1 = await canDecode(m.imageBlob(imgs[0]))
+  check('迁移后的图片能在浏览器里解码显示', dec1.ok, dec1.why)
+  const dec2 = await canDecode(m.imageBlob(imgs[1]))
+  check('第二张图片能在浏览器里解码显示', dec2.ok, dec2.why)
+  const decA = await canDecode(m.avatarBlob(ch))
+  check('迁移后的头像能解码显示', decA.ok, decA.why)
+
+  // ---------- 4) 参考板「保存布局」反复写回（原 bug 场景） ----------
+  for (let i = 0; i < 10; i++) {
+    await m.updateImage('img-old-1', { positionX: i * 10, positionY: i * 8 })
+  }
+  const after = await m.getImage('img-old-1')
+  check('反复保存布局 10 轮后坐标已写入', after.positionX === 90 && after.positionY === 72)
+  check('反复保存布局 10 轮后字节长度不变', after.data.byteLength === bytesA.byteLength)
+  check('反复保存布局 10 轮后字节内容一字不差',
+    new Uint8Array(after.data).every((v, i) => v === bytesA[i]))
+  const dec3 = await canDecode(m.imageBlob(after))
+  check('反复保存后图片仍能解码显示（关键）', dec3.ok, dec3.why)
+
+  // ---------- 5) 新上传路径（File -> readBytes -> 入库 -> 解码） ----------
+  const upBytes = await makePngBytes(200, 200, '#1e8449', 'NEW')
+  const file = new File([upBytes], 'NEW.png', { type: 'image/png' })
+  const read = await m.readBytes(file)
+  const rec = m.makeImageRecord('char-old', file, null)
+  rec.data = read.data
+  rec.mimeType = read.mimeType
+  await m.addImages([rec])
+  const fresh = await m.getImage(rec.id)
+  check('新上传的图片以字节入库', !!fresh.data && !fresh.blob, `byteLength=${fresh.data?.byteLength}`)
+  check('新上传字节与文件一致',
+    new Uint8Array(fresh.data).every((v, i) => v === upBytes[i]))
+  await m.updateImage(rec.id, { note: '新图备注', positionX: 12, positionY: 34 })
+  const fresh2 = await m.getImage(rec.id)
+  const dec4 = await canDecode(m.imageBlob(fresh2))
+  check('新上传图片保存备注/位置后仍能解码显示', dec4.ok, dec4.why)
+
+  // ---------- 6) 模拟"反复打开页面"：迁移不重跑、数据不乱 ----------
+  const imgs2 = await m.getImagesByCharacter('char-old')
+  check('旧图片坐标已持久化（重新读取仍是保存值）',
+    imgs2.find(x => x.id === 'img-old-1').positionX === 90)
+  check('数据里没有任何残留的 Blob 字段',
+    imgs2.every(x => !('blob' in x)))
+
+  // 清掉自检数据，别留在浏览器里
+  await m.deleteCharacter('char-old')
+  check('自检数据已清理', (await m.getImagesByCharacter('char-old')).length === 0)
+} catch (err) {
+  lines.push('✘ 自检过程抛错：' + (err && err.stack ? err.stack : err))
+  fail.push('脚本异常')
+}
+
+done()
+</script>
+</body>
+</html>
